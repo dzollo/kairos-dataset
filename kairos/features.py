@@ -5,6 +5,7 @@ Feature groups
 content:  text/formatting, content type, calendar and media metadata
 history:  author reaction history, posting cadence, and author-relative style
 profile:  simple structured author-profile summaries (when supplied)
+semantic: similarity to earlier posts and skill relevance (see semantic.py)
 artefact: collection age and position in an author's history
 
 Every feature derived from historical outcomes uses strictly earlier posts:
@@ -148,8 +149,32 @@ PROFILE_NUM = [
     "profile_n_positions",
 ]
 
+WINDOWS = (5, 20)  # must match kairos.semantic.WINDOWS
+KNN_KS = (3, 10)  # must match kairos.semantic.KNN_KS
+
+SEMANTIC_NUM = [
+    # history similarity
+    "sim_prev_1",
+    *[f"sim_{stat}_{w}" for w in WINDOWS for stat in ("mean", "max")],
+    f"sim_centroid_{WINDOWS[-1]}",
+    "sim_centroid_all",
+    # skill relevance
+    "skill_bm25",
+    "skill_bm25_per_term",
+    "skill_hit_share",
+    "skill_emb_max",
+    "skill_emb_centroid",
+    # kNN over past posts (reactions of similar earlier posts)
+    *[
+        f"knn_{sim}_{stat}_reaction_{k}"
+        for sim in ("emb", "bm25")
+        for stat in ("mean", "max", "min")
+        for k in KNN_KS
+    ],
+]
+
 ARTEFACT_NUM = ["age_days", "hist_n"]
-NUMERIC_FEATURES = CONTENT_NUM + HISTORY_NUM + PROFILE_NUM + ARTEFACT_NUM
+NUMERIC_FEATURES = CONTENT_NUM + HISTORY_NUM + PROFILE_NUM + SEMANTIC_NUM + ARTEFACT_NUM
 
 # Content-type keywords that hint at attached media, used when no manifest is given.
 _TYPE_PATTERNS = {
@@ -455,18 +480,20 @@ def _merge_profile_features(df: pd.DataFrame, profiles: pd.DataFrame) -> pd.Data
     return df.drop(columns=columns, errors="ignore").join(profiles, on="author")
 
 
-def _merge_media_features(df: pd.DataFrame, media: pd.DataFrame) -> pd.DataFrame:
-    """Join per-post media columns (last duplicate wins)."""
+def _merge_post_features(
+    df: pd.DataFrame, table: pd.DataFrame, wanted: list[str], name: str
+):
+    """Join per-post columns keyed by (author, post); last duplicate wins."""
     keys = ["author", "post"]
-    if not set(keys) <= set(media.columns):
-        raise ValueError("media_features must contain 'author' and 'post' columns")
+    if not set(keys) <= set(table.columns):
+        raise ValueError(f"{name} must contain 'author' and 'post' columns")
 
-    columns = [col for col in MEDIA_NUM if col in media.columns]
+    columns = [col for col in wanted if col in table.columns]
     if not columns:
         return df
-    media = media[keys + columns].drop_duplicates(keys, keep="last")
+    table = table[keys + columns].drop_duplicates(keys, keep="last")
     return df.drop(columns=columns, errors="ignore").merge(
-        media, on=keys, how="left", sort=False, validate="many_to_one"
+        table, on=keys, how="left", sort=False, validate="many_to_one"
     )
 
 
@@ -474,16 +501,21 @@ def _add_optional_features(
     df: pd.DataFrame,
     profile_features: pd.DataFrame | None,
     media_features: pd.DataFrame | None,
+    semantic_features: pd.DataFrame | None,
 ) -> pd.DataFrame:
     """Merge the optional tables and guarantee a stable column schema."""
     if profile_features is not None:
         df = _merge_profile_features(df, profile_features)
     if media_features is not None:
-        df = _merge_media_features(df, media_features)
+        df = _merge_post_features(df, media_features, MEDIA_NUM, "media_features")
+    if semantic_features is not None:
+        df = _merge_post_features(
+            df, semantic_features, SEMANTIC_NUM, "semantic_features"
+        )
 
-    for column in PROFILE_NUM + MEDIA_NUM:
-        if column not in df.columns:
-            df[column] = np.nan
+    # Semantic columns stay NaN when unknown (no history, no skills); the model imputes.
+    missing = [c for c in PROFILE_NUM + SEMANTIC_NUM + MEDIA_NUM if c not in df.columns]
+    df = df.assign(**dict.fromkeys(missing, np.nan))
 
     if media_features is not None:
         # With a manifest, "no manifest row" means "no attached files".
@@ -504,6 +536,7 @@ def build(
     followers: pd.Series,
     profile_features: pd.DataFrame | None = None,
     media_features: pd.DataFrame | None = None,
+    semantic_features: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build all non-deep features for every own post.
 
@@ -520,6 +553,8 @@ def build(
         with an ``author`` column).
     media_features:
         Optional output of ``data.load_media_features``, keyed by author and post.
+    semantic_features:
+        Optional output of ``semantic.build_semantic_features``, keyed by author and post.
     """
     missing = sorted(_REQUIRED_COLUMNS - set(levelled.columns))
     if missing:
@@ -538,7 +573,7 @@ def build(
     _add_cadence_features(df)
     _add_style_features(df)
     _add_level_and_spread(df)
-    df = _add_optional_features(df, profile_features, media_features)
+    df = _add_optional_features(df, profile_features, media_features, semantic_features)
 
     return df.sort_values("__feature_order", kind="mergesort").drop(
         columns="__feature_order"

@@ -172,6 +172,19 @@ def _profile_row(author: str, profile: dict) -> dict:
     }
 
 
+def load_author_skills(data_dir: Path | str = DATA_DIR) -> dict[str, list[str]]:
+    """Author -> list of skill names (empty list when the profile has none)."""
+    data_dir = _release(data_dir)
+    skills = {}
+    for author, profile in _iter_profiles(data_dir):
+        entries = profile.get("skills") or []
+        names = [e.get("name") if isinstance(e, dict) else e for e in entries]
+        skills[author] = [
+            name.strip() for name in names if isinstance(name, str) and name.strip()
+        ]
+    return skills
+
+
 def load_author_features(data_dir: Path | str = DATA_DIR) -> pd.DataFrame:
     """Small profile summaries from authors/*.json, indexed by author.
 
